@@ -18,5 +18,5 @@ RUN mkdir -p uploads outputs
 # Expõe a porta original
 EXPOSE 2929
 
-# Usar Gunicorn como servidor de produção na porta original
-CMD ["gunicorn", "--bind", "0.0.0.0:2929", "--workers", "4", "--timeout", "120", "app:app"]
+# Usar Gunicorn com --preload para eliminar cold start (aquece tudo antes do primeiro usuario)
+CMD ["gunicorn", "--bind", "0.0.0.0:2929", "--workers", "4", "--timeout", "120", "--preload", "app:app"]

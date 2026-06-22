@@ -5,8 +5,6 @@ services:
     build: .
     container_name: robo_cartao
     restart: unless-stopped
-    ports:
-      - "2929:2929"
     environment:
       - FLASK_DEBUG=False
     # Os volumes garantem que arquivos na fila de processamento 

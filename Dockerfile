@@ -15,8 +15,8 @@ COPY . .
 # Cria os diretórios necessários
 RUN mkdir -p uploads outputs
 
-# Expõe a porta
-EXPOSE 2929
+# Expõe a porta 80 (padrão web, o Traefik reconhece automaticamente)
+EXPOSE 80
 
-# Usar Gunicorn como servidor de produção
-CMD ["gunicorn", "--bind", "0.0.0.0:2929", "--workers", "4", "--timeout", "120", "app:app"]
+# Usar Gunicorn como servidor de produção na porta 80
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "4", "--timeout", "120", "app:app"]

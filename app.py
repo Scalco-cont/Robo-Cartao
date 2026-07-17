@@ -790,15 +790,6 @@ def upload_files():
                 'status': 'uploaded'
             })
 
-    # === DIAGNÓSTICO TEMPORÁRIO (só logging, nenhuma mudança de comportamento) ===
-    print(
-        f"[DIAG] /upload pid={os.getpid()} session={session_id} "
-        f"file_ids={[f['file_id'] for f in uploaded_files]} "
-        f"total_files_na_sessao={len(sessions_data[session_id]['files'])}",
-        flush=True
-    )
-    # === FIM DIAGNÓSTICO TEMPORÁRIO ===
-
     return jsonify({
         'message': MESSAGES['upload_success'].format(count=len(uploaded_files)),
         'files': uploaded_files,
@@ -812,58 +803,34 @@ def process_files():
     session_id = get_session_id()
     init_session_data(session_id)
 
-    # === DIAGNÓSTICO TEMPORÁRIO (só logging, nenhuma mudança de comportamento) ===
-    print(
-        f"[DIAG] /process ENTROU pid={os.getpid()} session={session_id} "
-        f"processing_atual={sessions_data[session_id]['processing']} "
-        f"file_ids_na_sessao={list(sessions_data[session_id]['files'].keys())} "
-        f"sessoes_conhecidas_neste_worker={list(sessions_data.keys())}",
-        flush=True
-    )
-    # === FIM DIAGNÓSTICO TEMPORÁRIO ===
-
     with processing_locks[session_id]:
         if sessions_data[session_id]['processing']:
-            print(f"[DIAG] /process 400 'ja existe processamento' pid={os.getpid()} session={session_id}", flush=True)
             return jsonify({'error': 'Já existe um processamento em andamento'}), 400
 
         if not sessions_data[session_id]['files']:
-            print(f"[DIAG] /process 400 'nenhum arquivo' pid={os.getpid()} session={session_id}", flush=True)
             return jsonify({'error': 'Nenhum arquivo para processar'}), 400
 
         sessions_data[session_id]['processing'] = True
 
     # Inicia threads para processar cada arquivo
     threads = []
-    try:
-        for file_id, file_data in sessions_data[session_id]['files'].items():
-            if file_data['status'] == 'uploaded':
-                file_data['status'] = 'processing'
+    for file_id, file_data in sessions_data[session_id]['files'].items():
+        if file_data['status'] == 'uploaded':
+            file_data['status'] = 'processing'
+            
+            thread = threading.Thread(
+                target=process_file_worker,
+                args=(session_id, file_id, file_data['filepath'], file_data['original_filename'])
+            )
+            thread.start()
+            threads.append(thread)
 
-                thread = threading.Thread(
-                    target=process_file_worker,
-                    args=(session_id, file_id, file_data['filepath'], file_data['original_filename'])
-                )
-                thread.start()
-                threads.append(thread)
-
-        # Aguarda todas as threads finalizarem
-        for thread in threads:
-            thread.join()
-    except Exception:
-        # === DIAGNÓSTICO TEMPORÁRIO ===
-        import traceback
-        print(
-            f"[DIAG] /process EXCECAO pid={os.getpid()} session={session_id}\n{traceback.format_exc()}",
-            flush=True
-        )
-        # === FIM DIAGNÓSTICO TEMPORÁRIO ===
-        raise  # preserva o comportamento original: propaga pro Flask (vira 500, processing fica True)
+    # Aguarda todas as threads finalizarem
+    for thread in threads:
+        thread.join()
 
     with processing_locks[session_id]:
         sessions_data[session_id]['processing'] = False
-
-    print(f"[DIAG] /process CONCLUIU pid={os.getpid()} session={session_id}", flush=True)
 
     return jsonify({'message': MESSAGES['processing_complete']})
 

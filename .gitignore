@@ -13,6 +13,9 @@ uploads/*
 outputs/*
 !outputs/.gitkeep
 backup/
+sessions.db
+sessions.db-wal
+sessions.db-shm
 
 # OS files
 .DS_Store

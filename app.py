@@ -1,7 +1,8 @@
 import os
 import uuid
+import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, jsonify, send_file, session, render_template
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -18,9 +19,51 @@ CORS(app)
 os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(Config.OUTPUT_FOLDER, exist_ok=True)
 
-# Armazenamento de sessões (em produção, usar Redis ou banco de dados)
-sessions_data = {}
-processing_locks = {}
+# Armazenamento de sessões: SQLite compartilhado entre os workers gunicorn.
+# Sem volume — o arquivo vive no filesystem do container e some a cada redeploy,
+# igual ao comportamento anterior em memória (decisão registrada em DESIGN_1.1_1.3.md).
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions.db')
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                processing INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                filename TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                filepath TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                txt_content TEXT,
+                txt_filename TEXT,
+                txt_path TEXT,
+                upload_time TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id)")
+    finally:
+        conn.close()
+
+
+init_db()
 
 
 def allowed_file(filename):
@@ -443,46 +486,80 @@ def get_session_id():
 
 
 def init_session_data(session_id):
-    """Inicializa dados da sessão"""
-    if session_id not in sessions_data:
-        sessions_data[session_id] = {
-            'files': {},
-            'processing': False,
-            'created_at': datetime.now()
-        }
-        processing_locks[session_id] = threading.Lock()
+    """Garante que a sessão existe no banco compartilhado entre workers"""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, processing, created_at) VALUES (?, 0, ?)",
+            (session_id, datetime.now().isoformat())
+        )
+    finally:
+        conn.close()
 
 
-def cleanup_old_sessions():
-    """Remove sessões antigas (execução periódica recomendada)"""
-    current_time = datetime.now()
-    sessions_to_remove = []
-    
-    for session_id, data in sessions_data.items():
-        if current_time - data['created_at'] > timedelta(seconds=Config.SESSION_TIMEOUT):
-            sessions_to_remove.append(session_id)
-    
-    for session_id in sessions_to_remove:
-        # Remove arquivos temporários
-        if session_id in sessions_data:
-            for file_data in sessions_data[session_id]['files'].values():
-                # Remove XLSX da pasta uploads
-                if 'filepath' in file_data and os.path.exists(file_data['filepath']):
+def try_start_processing(session_id):
+    """(True, None) se marcou processing=1; (False, motivo) se não pôde.
+    Propaga sqlite3.OperationalError se não conseguir nem abrir a transação (lock ocupado)."""
+    conn = get_conn()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        conn.close()
+        raise  # sem transação aberta — não tentar ROLLBACK aqui
+
+    try:
+        row = conn.execute("SELECT processing FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if row and row[0]:
+            conn.execute("ROLLBACK")
+            return False, "Já existe um processamento em andamento"
+
+        n = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE session_id=? AND status='uploaded'", (session_id,)
+        ).fetchone()[0]
+        if n == 0:
+            conn.execute("ROLLBACK")
+            return False, "Nenhum arquivo para processar"
+
+        conn.execute("UPDATE sessions SET processing=1 WHERE session_id=?", (session_id,))
+        conn.execute("COMMIT")
+        return True, None
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def set_processing(session_id, value):
+    conn = get_conn()
+    try:
+        conn.execute("UPDATE sessions SET processing=? WHERE session_id=?", (value, session_id))
+    finally:
+        conn.close()
+
+
+def cleanup_completed_files(session_id):
+    """Remove do disco (xlsx + txt) e do banco os arquivos já concluídos/com erro."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT filepath, txt_path FROM files WHERE session_id=? AND status IN ('completed','error')",
+            (session_id,)
+        ).fetchall()
+        for filepath, txt_path in rows:
+            for p in (filepath, txt_path):
+                if p and os.path.exists(p):
                     try:
-                        os.remove(file_data['filepath'])
-                    except:
+                        os.remove(p)
+                    except Exception:
                         pass
-                
-                # Remove TXT da pasta outputs
-                if 'txt_path' in file_data and os.path.exists(file_data['txt_path']):
-                    try:
-                        os.remove(file_data['txt_path'])
-                    except:
-                        pass
-            
-            del sessions_data[session_id]
-            if session_id in processing_locks:
-                del processing_locks[session_id]
+        conn.execute(
+            "DELETE FROM files WHERE session_id=? AND status IN ('completed','error')", (session_id,)
+        )
+        return len(rows)
+    finally:
+        conn.close()
 
 
 def process_xlsx_to_txt(caminho_xlsx, nome_arquivo):
@@ -687,38 +764,38 @@ def process_xlsx_to_txt(caminho_xlsx, nome_arquivo):
 
 def process_file_worker(session_id, file_id, caminho_arquivo, nome_original):
     """Worker para processar arquivo em thread separada"""
+    conn = get_conn()  # conexão própria da thread — sqlite3 não é thread-safe entre conexões compartilhadas
     try:
         # Processa o arquivo
         txt_content, erro = process_xlsx_to_txt(caminho_arquivo, nome_original)
 
         if erro:
-            with processing_locks[session_id]:
-                sessions_data[session_id]['files'][file_id]['status'] = 'error'
-                sessions_data[session_id]['files'][file_id]['error'] = erro
+            conn.execute(
+                "UPDATE files SET status='error', error=? WHERE file_id=?", (erro, file_id)
+            )
         else:
             # Salva o TXT gerado
             nome_base = os.path.splitext(nome_original)[0]
             nome_txt = f"{nome_base}.txt"
             txt_path = os.path.join(Config.OUTPUT_FOLDER, f"{session_id}_{file_id}_{nome_txt}")
-            
+
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(txt_content)
 
-            with processing_locks[session_id]:
-                sessions_data[session_id]['files'][file_id]['status'] = 'completed'
-                sessions_data[session_id]['files'][file_id]['txt_content'] = txt_content
-                sessions_data[session_id]['files'][file_id]['txt_filename'] = nome_txt
-                sessions_data[session_id]['files'][file_id]['txt_path'] = txt_path
+            conn.execute(
+                "UPDATE files SET status='completed', txt_content=?, txt_filename=?, txt_path=? WHERE file_id=?",
+                (txt_content, nome_txt, txt_path, file_id)
+            )
 
     except Exception as e:
         import traceback
         erro_completo = f"Erro inesperado no worker:\n{str(e)}\n\n{traceback.format_exc()}"
-        
-        with processing_locks[session_id]:
-            sessions_data[session_id]['files'][file_id]['status'] = 'error'
-            sessions_data[session_id]['files'][file_id]['error'] = erro_completo
-    
+        conn.execute(
+            "UPDATE files SET status='error', error=? WHERE file_id=?", (erro_completo, file_id)
+        )
+
     finally:
+        conn.close()
         # Remove o arquivo XLSX temporário após o processamento
         if os.path.exists(caminho_arquivo):
             try:
@@ -748,52 +825,39 @@ def upload_files():
         return jsonify({'error': MESSAGES['upload_error']}), 400
 
     # Limpa arquivos já processados antes de adicionar novos
-    with processing_locks[session_id]:
-        files_to_remove = []
-        for file_id, file_data in sessions_data[session_id]['files'].items():
-            if file_data['status'] in ['completed', 'error']:
-                # Remove arquivo temporário se existir
-                if os.path.exists(file_data['filepath']):
-                    try:
-                        os.remove(file_data['filepath'])
-                    except:
-                        pass
-                files_to_remove.append(file_id)
-        
-        # Remove da memória
-        for file_id in files_to_remove:
-            del sessions_data[session_id]['files'][file_id]
+    cleared_previous = cleanup_completed_files(session_id)
 
     uploaded_files = []
+    conn = get_conn()
+    try:
+        for file in files:
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file_id = str(uuid.uuid4())
 
-    for file in files:
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file_id = str(uuid.uuid4())
-            
-            # Salva arquivo temporariamente
-            filepath = os.path.join(Config.UPLOAD_FOLDER, f"{session_id}_{file_id}_{filename}")
-            file.save(filepath)
+                # Salva arquivo temporariamente
+                filepath = os.path.join(Config.UPLOAD_FOLDER, f"{session_id}_{file_id}_{filename}")
+                file.save(filepath)
 
-            # Armazena informações do arquivo
-            sessions_data[session_id]['files'][file_id] = {
-                'filename': filename,
-                'original_filename': file.filename,
-                'filepath': filepath,
-                'status': 'uploaded',
-                'upload_time': datetime.now().isoformat()
-            }
+                # Armazena informações do arquivo
+                conn.execute(
+                    "INSERT INTO files (file_id, session_id, filename, original_filename, filepath, status, upload_time) "
+                    "VALUES (?, ?, ?, ?, ?, 'uploaded', ?)",
+                    (file_id, session_id, filename, file.filename, filepath, datetime.now().isoformat())
+                )
 
-            uploaded_files.append({
-                'file_id': file_id,
-                'filename': file.filename,
-                'status': 'uploaded'
-            })
+                uploaded_files.append({
+                    'file_id': file_id,
+                    'filename': file.filename,
+                    'status': 'uploaded'
+                })
+    finally:
+        conn.close()
 
     return jsonify({
         'message': MESSAGES['upload_success'].format(count=len(uploaded_files)),
         'files': uploaded_files,
-        'cleared_previous': len(files_to_remove) if 'files_to_remove' in locals() else 0
+        'cleared_previous': cleared_previous
     })
 
 
@@ -803,34 +867,40 @@ def process_files():
     session_id = get_session_id()
     init_session_data(session_id)
 
-    with processing_locks[session_id]:
-        if sessions_data[session_id]['processing']:
-            return jsonify({'error': 'Já existe um processamento em andamento'}), 400
+    try:
+        ok, erro = try_start_processing(session_id)
+    except sqlite3.OperationalError:
+        return jsonify({'error': 'Sistema ocupado, tente novamente'}), 503
 
-        if not sessions_data[session_id]['files']:
-            return jsonify({'error': 'Nenhum arquivo para processar'}), 400
-
-        sessions_data[session_id]['processing'] = True
+    if not ok:
+        return jsonify({'error': erro}), 400
 
     # Inicia threads para processar cada arquivo
-    threads = []
-    for file_id, file_data in sessions_data[session_id]['files'].items():
-        if file_data['status'] == 'uploaded':
-            file_data['status'] = 'processing'
-            
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT file_id, filepath, original_filename FROM files WHERE session_id=? AND status='uploaded'",
+            (session_id,)
+        ).fetchall()
+
+        threads = []
+        for file_id, filepath, original_filename in rows:
+            conn.execute("UPDATE files SET status='processing' WHERE file_id=?", (file_id,))
             thread = threading.Thread(
                 target=process_file_worker,
-                args=(session_id, file_id, file_data['filepath'], file_data['original_filename'])
+                args=(session_id, file_id, filepath, original_filename)
             )
             thread.start()
             threads.append(thread)
+    finally:
+        conn.close()
 
     # Aguarda todas as threads finalizarem
-    for thread in threads:
-        thread.join()
-
-    with processing_locks[session_id]:
-        sessions_data[session_id]['processing'] = False
+    try:
+        for thread in threads:
+            thread.join()
+    finally:
+        set_processing(session_id, 0)  # fix do bug 1.3: sempre reseta, exceção ou não
 
     return jsonify({'message': MESSAGES['processing_complete']})
 
@@ -841,17 +911,23 @@ def get_status():
     session_id = get_session_id()
     init_session_data(session_id)
 
-    files_status = []
-    for file_id, file_data in sessions_data[session_id]['files'].items():
-        files_status.append({
-            'file_id': file_id,
-            'filename': file_data['original_filename'],
-            'status': file_data['status'],
-            'error': file_data.get('error', None)
-        })
+    conn = get_conn()
+    try:
+        processing_row = conn.execute(
+            "SELECT processing FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        files = conn.execute(
+            "SELECT file_id, original_filename, status, error FROM files WHERE session_id=?", (session_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    files_status = [
+        {'file_id': f[0], 'filename': f[1], 'status': f[2], 'error': f[3]} for f in files
+    ]
 
     return jsonify({
-        'processing': sessions_data[session_id]['processing'],
+        'processing': bool(processing_row[0]) if processing_row else False,
         'files': files_status
     })
 
@@ -862,29 +938,38 @@ def download_file(file_id):
     session_id = get_session_id()
     init_session_data(session_id)
 
-    if file_id not in sessions_data[session_id]['files']:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT status, original_filename, txt_path, txt_content, txt_filename FROM files "
+            "WHERE file_id=? AND session_id=?",
+            (file_id, session_id)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
         return jsonify({'error': MESSAGES['file_not_found']}), 404
 
-    file_data = sessions_data[session_id]['files'][file_id]
+    status, original_filename, txt_path, txt_content, txt_filename = row
 
-    if file_data['status'] != 'completed':
+    if status != 'completed':
         return jsonify({'error': MESSAGES['file_not_processed']}), 400
 
     # Verifica se o arquivo TXT existe no disco
-    if 'txt_path' in file_data and os.path.exists(file_data['txt_path']):
+    if txt_path and os.path.exists(txt_path):
         # Envia o arquivo do disco
         return send_file(
-            file_data['txt_path'],
+            txt_path,
             as_attachment=True,
-            download_name=file_data['txt_filename'],
+            download_name=txt_filename,
             mimetype='text/plain'
         )
     else:
         # Fallback: cria arquivo em memória (caso o arquivo no disco tenha sido removido)
-        nome_base = os.path.splitext(file_data['original_filename'])[0]
+        nome_base = os.path.splitext(original_filename)[0]
         nome_txt = f"{nome_base}.txt"
-        
-        txt_content = file_data['txt_content']
+
         buffer = io.BytesIO()
         buffer.write(txt_content.encode('utf-8'))
         buffer.seek(0)
@@ -901,27 +986,23 @@ def download_file(file_id):
 def clear_files():
     """Endpoint para limpar arquivos da sessão"""
     session_id = get_session_id()
-    
-    if session_id in sessions_data:
-        # Remove arquivos temporários (XLSX e TXT)
-        for file_data in sessions_data[session_id]['files'].values():
-            # Remove XLSX temporário da pasta uploads
-            if 'filepath' in file_data and os.path.exists(file_data['filepath']):
-                try:
-                    os.remove(file_data['filepath'])
-                except:
-                    pass
-            
-            # Remove TXT gerado da pasta outputs
-            if 'txt_path' in file_data and os.path.exists(file_data['txt_path']):
-                try:
-                    os.remove(file_data['txt_path'])
-                except:
-                    pass
-        
-        # Limpa dados da sessão
-        sessions_data[session_id]['files'] = {}
-        sessions_data[session_id]['processing'] = False
+
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT filepath, txt_path FROM files WHERE session_id=?", (session_id,)
+        ).fetchall()
+        for filepath, txt_path in rows:
+            for p in (filepath, txt_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except:
+                        pass
+        conn.execute("DELETE FROM files WHERE session_id=?", (session_id,))
+        conn.execute("UPDATE sessions SET processing=0 WHERE session_id=?", (session_id,))
+    finally:
+        conn.close()
 
     return jsonify({'message': MESSAGES['clear_success']})
 
@@ -932,11 +1013,17 @@ def health_check():
     # Conta arquivos nas pastas
     uploads_count = len([f for f in os.listdir(Config.UPLOAD_FOLDER) if f != '.gitkeep'])
     outputs_count = len([f for f in os.listdir(Config.OUTPUT_FOLDER) if f != '.gitkeep'])
-    
+
+    conn = get_conn()
+    try:
+        active_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'active_sessions': len(sessions_data),
+        'active_sessions': active_sessions,
         'uploads_folder_files': uploads_count,
         'outputs_folder_files': outputs_count
     })

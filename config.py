@@ -69,6 +69,14 @@ PARAMETROS = {
         "linha1": "1192;4918;447",
         "linha2": "1228;1192;449",
     },
+    "get net antecipacao": { # Nome do arquivo
+        "palavra_data": "DATA DA CONTRATAÇÃO",
+        "palavra_valor": "VALOR ATUAL",
+        "palavra_taxa": "TAXA DESCONTO",
+        "ocorrencia": 1,
+        "linha1": "5015;1191;22",
+        "linha2": "4701;5015;370",
+    },
     "redecard credito": { # Nome do arquivo
         "palavra_data": "data da venda",
         "palavra_valor": "valor da venda atualizado",

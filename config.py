@@ -245,8 +245,8 @@ PARAMETROS = {
     },
     "posto grupo estacao sicredi debito e credito": {
         "palavra_data": "Data da venda",
-        "palavra_valor": "Valor bruto",
-        "palavra_taxa": "Valor da taxa",
+        "palavra_valor": "Valor bruto da transação",
+        "palavra_taxa": "Valor da taxa (MDR)",
         "ocorrencia": 1,
         # Configuração para identificar débito/crédito por coluna
         "identificar_por_coluna": {

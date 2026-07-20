@@ -243,6 +243,28 @@ PARAMETROS = {
             }
         }
     },
+    "posto grupo estacao sicredi debito e credito": {
+        "palavra_data": "Data da venda",
+        "palavra_valor": "Valor bruto",
+        "palavra_taxa": "Valor da taxa",
+        "ocorrencia": 1,
+        # Configuração para identificar débito/crédito por coluna
+        "identificar_por_coluna": {
+            "nome_coluna": "Produto",  # Nome da coluna que tem "Debito" ou "Credito"
+            "debito": {
+                # Valores possíveis que indicam débito (case-insensitive)
+                "valores": ["Débito"],
+                "linha1": "428;4918;483",
+                "linha2": "1228;428;481",
+            },
+            "credito": {
+                # Valores possíveis que indicam crédito (case-insensitive)
+                "valores": ["Crédito à vista", "Parcelado Lojista"],
+                "linha1": "429;4918;482",
+                "linha2": "1228;429;480",
+            }
+        }
+    },
     "instituto emilia cielo": {
         "palavra_data": "Data da venda",
         "palavra_valor": "Valor bruto",

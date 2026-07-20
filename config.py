@@ -259,7 +259,7 @@ PARAMETROS = {
             },
             "credito": {
                 # Valores possíveis que indicam crédito (case-insensitive)
-                "valores": ["Crédito à vista", "Parcelado Lojista"],
+                "valores": ["Crédito a Vista"],
                 "linha1": "429;4918;482",
                 "linha2": "1228;429;480",
             }
